@@ -28,28 +28,32 @@ class SMSContext:
     twilio_config: TwilioConfig
 
 
-INSTRUCTIONS = """You are a friendly SMS assistant.
+INSTRUCTIONS = """You are a friendly SMS assistant. You have full conversation history with this user — use it to give contextual answers.
 
-CRITICAL: You cannot reply directly. You MUST use send_sms tool to send any response. Never just write text — always call send_sms with your message.
+CRITICAL: You cannot reply directly. You MUST use send_sms tool to send any response.
 
 Tools:
 - get_weather(city): Get weather info
-- send_sms(message): Send reply to user — ALWAYS use this to respond
-- skip_response(reason): Skip automated/spam messages only
+- send_sms(message): Send reply — USE THIS FOR ALL REAL MESSAGES
+- skip_response(reason): RARELY use, only for obvious spam
 
-When to skip (use skip_response):
-- Carrier/voicemail notifications
-- Marketing spam, "STOP" requests
-- Auto-replies from systems
+ALWAYS RESPOND with send_sms to:
+- Any message from a real person
+- Short messages like "nice", "ok", "thanks" — these are real people!
+- Questions about previous conversation — you CAN see the history, reference it!
 
-Style: friendly, casual, short (under 160 chars). No markdown.
+ONLY skip_response for:
+- "STOP", "UNSUBSCRIBE" — opt-out requests
+- Obvious automated messages like "Your code is 123456"
 
-REMEMBER: To reply, you must call send_sms(). Do not just write text."""
+When in doubt — RESPOND. Real humans deserve a reply.
+
+Style: friendly, casual, short (under 160 chars). No markdown."""
 
 
 class SMSAgent(AgentTask[SMSResult]):
-    def __init__(self) -> None:
-        super().__init__(instructions=INSTRUCTIONS)
+    def __init__(self, chat_ctx: ChatContext | None = None) -> None:
+        super().__init__(instructions=INSTRUCTIONS, chat_ctx=chat_ctx)
 
     @function_tool()
     async def get_weather(self, context: RunContext[SMSContext], city: str) -> str:
@@ -104,17 +108,19 @@ async def process_sms(
         twilio_config=reply_config,
     )
 
+    # Load conversation history
+    saved_ctx = context_manager.get(from_number)
+    if saved_ctx:
+        logger.info(f"Restored {len(saved_ctx.items)} history items")
+    else:
+        logger.info("No history, starting fresh")
+
     async with AgentSession[SMSContext](
         llm="openai/gpt-4o-mini",
         userdata=sms_context,
         max_tool_steps=10,
     ) as session:
-        await session.start(SMSAgent())
-
-        # Restore conversation history if available
-        saved = context_manager.get_chat_ctx_dict(from_number)
-        if saved:
-            session.history.merge(ChatContext.from_dict(saved))
+        await session.start(SMSAgent(chat_ctx=saved_ctx))
 
         sms_result: SMSResult | None = None
         try:
@@ -123,23 +129,22 @@ async def process_sms(
         except RuntimeError as e:
             logger.warning(f"Agent didn't call tool: {e}")
 
-        # Save conversation context (excluding handoff items)
-        items = [i for i in session.history.items if i.type != "agent_handoff"]
-        context_manager.save_chat_ctx(
-            from_number,
-            ChatContext(items).to_dict(exclude_function_call=False),
-        )
+        # Merge old history + new items and save
+        old_items = saved_ctx.items if saved_ctx else []
+        new_items = session.history.items
+        all_items = list(old_items) + list(new_items)
+        context_manager.save(from_number, ChatContext(all_items))
 
         # Log stats
-        user_msgs = sum(1 for i in items if i.type == "message" and i.role == "user")
-        tool_calls = sum(1 for i in items if i.type == "function_call")
-        logger.info(f"Context: {len(items)} items | {user_msgs} user msgs | {tool_calls} tool calls")
+        user_msgs = sum(1 for i in all_items if i.type == "message" and i.role == "user")
+        tool_calls = sum(1 for i in all_items if i.type == "function_call")
+        logger.info(f"Context: {len(all_items)} items | {user_msgs} user msgs | {tool_calls} tool calls")
 
         if sms_result:
             return sms_result
 
         # Fallback: if agent generated text but forgot to call send_sms, send it anyway
-        for item in reversed(items):
+        for item in reversed(session.history.items):
             if item.type == "message" and item.role == "assistant":
                 text = item.content[0] if item.content else None
                 if text and isinstance(text, str):
