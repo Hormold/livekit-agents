@@ -1,4 +1,22 @@
-.venv
-venv
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Env
 .env
-.env.local
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Project specific
+conversations.json
