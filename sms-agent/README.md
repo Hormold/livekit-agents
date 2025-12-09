@@ -1,47 +1,102 @@
 # SMS Agent
 
-Template for an SMS agent using LiveKit Agents + Twilio.
+SMS agent using LiveKit Agents + Twilio. Two deployment approaches.
 
-## Setup
+## Quick Start
 
-```
+```bash
 uv sync
+```
+
+---
+
+## Approach 1: Self-Hosted
+
+Everything runs on your infrastructure. Single process handles webhooks and agent processing.
+
+```bash
 uv run server.py
 ```
 
-Env variables:
+Point Twilio webhook to `POST /webhook/twilio/receive`
 
-- TWILIO_ACCOUNT_SID
-- TWILIO_AUTH_TOKEN
-- TWILIO_PHONE_NUMBER (your Twilio phone number sending the SMS out to the user)
-- LIVEKIT_API_KEY
-- LIVEKIT_API_SECRET
-- LIVEKIT_URL
+**Files:**
+| File | Description |
+|------|-------------|
+| `server.py` | Webhook server + agent processing |
+| `agent/` | Agent logic, tools, context storage |
 
-Point Twilio webhook to POST /webhook/twilio/receive
+---
 
-## Files
+## Approach 2: LiveKit Cloud Dispatch
 
-server.py — HTTP server, webhooks, /test endpoint for debugging
+Split architecture for scalability. Your server handles webhooks + context, LiveKit Cloud runs the agent.
 
-agent/sms_agent.py — Main file. Agent logic and tools. Edit INSTRUCTIONS to change behavior.
+```
+Twilio → dispatcher.py → LiveKit Cloud → worker.py
+              ↑                              ↓
+              └────── context callback ──────┘
+```
 
-agent/http_tools.py — Example tool (weather). Add your own tools here.
+**Your Server** (webhooks + context management):
 
-agent/twilio_utils.py — Sends SMS via Twilio API.
+```bash
+WEBHOOK_URL=https://your-server.com uv run dispatcher.py
+```
 
-agent/context_manager.py — Saves conversation history per phone number to JSON.
+**Worker** (agent processing) — choose one:
 
-## How to customize
+```bash
+# Option A: Deploy to LiveKit Cloud
+lk cloud deploy
 
-Change agent behavior: edit INSTRUCTIONS in sms_agent.py
+# Option B: Run locally alongside dispatcher
+uv run worker.py dev
+```
 
-Add new tools: add @function_tool() methods to SMSAgent class
+On startup, `dispatcher.py` auto-configures Twilio webhook URL.
 
-Change LLM model: edit llm parameter in process_sms()
+**Files:**
+| File | Description | Runs on |
+|------|-------------|---------|
+| `dispatcher.py` | Webhooks + context + dispatch | Your server |
+| `worker.py` | Stateless agent worker | LiveKit Cloud or local |
+| `agent/` | Shared agent logic | Both |
+
+---
+
+## Environment Variables
+
+```bash
+# Both approaches
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+1...
+LIVEKIT_URL=...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+
+# Approach 2 only
+WEBHOOK_URL=https://your-server.com
+```
 
 ## Endpoints
 
-POST /webhook/twilio/receive — Twilio webhook
-POST /test — test with {"from": "+1234567890", "body": "Hello"}
-GET /health — health check
+**Approach 1 (`server.py`):**
+
+- `POST /webhook/twilio/receive` — Twilio webhook
+- `POST /test` — Test endpoint
+- `GET /health` — Health check
+
+**Approach 2 (`dispatcher.py`):**
+
+- `POST /webhook/twilio/receive` — Twilio webhook → dispatch
+- `POST /webhook/agent/complete` — Worker callback → save context
+- `GET /health` — Health check
+
+## Customization
+
+- **Agent behavior**: Edit `INSTRUCTIONS` in `agent/sms_agent.py`
+- **Add tools**: Add `@function_tool()` methods to `SMSAgent` class
+- **Change LLM**: Edit `llm` parameter
+- **Context storage**: Replace `ContextManager` with DB (see TODO comments)
