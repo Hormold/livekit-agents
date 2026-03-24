@@ -28,12 +28,16 @@ def main():
     frames: list[np.ndarray] = []
     stop = False
 
-    signal.signal(signal.SIGINT, lambda *_: setattr(main, "_stop", True) or None)
+    def on_signal(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, on_signal)
 
     sys.stderr.write(f"Recording → {args.output} @ {args.rate}Hz  [Ctrl+C to stop]\n")
 
     with sd.InputStream(samplerate=args.rate, channels=CHANNELS, dtype="int16") as mic:
-        while not getattr(main, "_stop", False):
+        while not stop:
             data, _ = mic.read(args.rate // 10)  # 100ms chunks
             frames.append(data.copy())
             sys.stderr.write(f"\r  {len(frames) * 0.1:.1f}s")

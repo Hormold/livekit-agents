@@ -37,19 +37,18 @@ CYAN = "\033[36m"
 SAMPLE_RATE = 16000
 
 
-async def transcribe_file(filepath: str, model: str, language: str, quiet: bool = False) -> str:
+async def transcribe_file(
+    filepath: str, model: str, language: str, *, http_session: aiohttp.ClientSession, quiet: bool = False,
+) -> str:
     """
     Push audio frames into the STT stream while collecting transcript events concurrently.
 
     Push and collect run in parallel so interim results appear during streaming.
     After all frames are pushed, flush() + end_input() signal the STT that audio is complete.
-    A 30s timeout after end_input guards against provider hangs.
+    A 5s timeout (60s for Deepgram) after end_input guards against provider hangs.
     """
     filename = os.path.basename(filepath)
 
-    # We run outside the LiveKit agent framework, so we manage our own HTTP session.
-    # (Inside an AgentSession this would be handled automatically.)
-    http_session = aiohttp.ClientSession()
     stt_instance = inference.STT(model=model, language=language, http_session=http_session)
     stream = stt_instance.stream()
 
@@ -78,15 +77,14 @@ async def transcribe_file(filepath: str, model: str, language: str, quiet: bool 
         sys.stderr.write(f"{CLEAR_LINE}{CYAN}[{elapsed:5.1f}s]{RESET} {text}")
         sys.stderr.flush()
 
-    # Deepgram needs all frames pushed fast then sequential collect.
-    # ElevenLabs (and others) need concurrent push+collect with pacing for live interims.
+    # Deepgram needs half-realtime pacing and longer timeout for finals.
+    # ElevenLabs (and others) need minimal pacing and exit on END_OF_SPEECH.
     is_deepgram = model.startswith("deepgram/")
 
     async def push_audio():
         """Decode the file and push PCM frames into the STT stream."""
         async for frame in audio_frames_from_file(filepath, sample_rate=SAMPLE_RATE, num_channels=1):
             stream.push_frame(frame)
-            # Deepgram needs half-realtime pacing, others need minimal pacing
             if is_deepgram:
                 await asyncio.sleep(frame.duration * 0.5)
             else:
@@ -113,7 +111,7 @@ async def transcribe_file(filepath: str, model: str, language: str, quiet: bool 
                     return
 
     async def collect_with_timeout():
-        """Let events flow, but force-stop 5s (or 30s for Deepgram) after input ends."""
+        """Let events flow, but force-stop 5s (or 60s for Deepgram) after input ends."""
         timeout = 60.0 if is_deepgram else 5.0
         task = asyncio.create_task(collect_transcript())
         await input_done.wait()
@@ -133,7 +131,6 @@ async def transcribe_file(filepath: str, model: str, language: str, quiet: bool 
     finally:
         await stream.aclose()
         await stt_instance.aclose()
-        await http_session.close()
 
     if not quiet:
         elapsed = time.time() - t0
@@ -146,14 +143,17 @@ async def transcribe_file(filepath: str, model: str, language: str, quiet: bool 
 async def run(args: argparse.Namespace) -> None:
     results: list[tuple[str, str]] = []
 
-    for filepath in args.files:
-        if not os.path.isfile(filepath):
-            sys.stderr.write(f"Error: file not found: {filepath}\n")
-            continue
-        transcript = await transcribe_file(
-            filepath, model=args.model, language=args.language, quiet=args.quiet,
-        )
-        results.append((filepath, transcript))
+    # Single session reused across all files
+    async with aiohttp.ClientSession() as http_session:
+        for filepath in args.files:
+            if not os.path.isfile(filepath):
+                sys.stderr.write(f"Error: file not found: {filepath}\n")
+                continue
+            transcript = await transcribe_file(
+                filepath, model=args.model, language=args.language,
+                http_session=http_session, quiet=args.quiet,
+            )
+            results.append((filepath, transcript))
 
     # Write final transcripts to stdout (or file with -o)
     out = open(args.output, "w") if args.output else sys.stdout
@@ -185,9 +185,6 @@ def main():
     p.add_argument("-q", "--quiet", action="store_true", help="Just output text, no live preview")
 
     asyncio.run(run(p.parse_args()))
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)  # kill lingering aiohttp/livekit background threads
 
 
 if __name__ == "__main__":
